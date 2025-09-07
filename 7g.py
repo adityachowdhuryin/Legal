@@ -40,15 +40,22 @@ import pdfplumber
 import docx2txt
 import spacy
 from textblob import TextBlob
+import tempfile
 
-# Enable GPU for spaCy if available
-spacy.prefer_gpu()
+# Use temporary directory for cloud compatibility
+temp_dir = tempfile.gettempdir()
+if not os.path.exists(temp_dir):
+    os.makedirs(temp_dir)
 
-# Detect device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Setup logging
-logging.basicConfig(filename='temp/app.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+# Setup logging to console and temporary file
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(temp_dir, 'app.log')),
+        logging.StreamHandler()
+    ]
+)
 
 # Try importing optional dependencies
 try:
@@ -56,24 +63,32 @@ try:
 except ImportError:
     logging.warning("The 'rouge-score' package is not installed. ROUGE metrics will be skipped.")
 
-# Download required NLTK data
-try:
-    nltk.download('punkt', quiet=True)
-except Exception as e:
-    st.error(f"Error downloading NLTK data: {e}")
-    raise
+# Setup dependencies
+def setup_dependencies():
+    try:
+        nltk.download('punkt', quiet=True)
+    except Exception as e:
+        st.error(f"Error downloading NLTK data: {e}")
+        logging.error(f"Error downloading NLTK data: {e}")
+        raise
+    try:
+        if not spacy.util.is_package("en_core_web_sm"):
+            spacy.cli.download("en_core_web_sm")
+        global nlp
+        nlp = spacy.load("en_core_web_sm", disable=['lemmatizer'])
+    except Exception as e:
+        st.error(f"Error loading spaCy model: {e}")
+        logging.error(f"Error loading spaCy model: {e}")
+        raise
 
-# Load spaCy model
-try:
-    nlp = spacy.load("en_core_web_sm", disable=['lemmatizer'])
-except Exception as e:
-    st.error(f"Error loading spaCy model: {e}")
-    logging.error(f"Error loading spaCy model: {e}")
-    raise
+# Call setup at the start
+setup_dependencies()
 
-# Create temp directory
-if not os.path.exists('temp'):
-    os.makedirs('temp')
+# Detect device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if device.type == "cpu":
+    logging.info("GPU not available, using CPU.")
+spacy.prefer_gpu()  # Attempt GPU, but spaCy will fallback to CPU if unavailable
 
 # Setups
 st.set_page_config(layout="wide")
@@ -81,7 +96,7 @@ try:
     image = Image.open('./banner.PNG')
     st.image(image)
 except FileNotFoundError:
-    st.warning("Banner image not found. Please ensure 'banner.PNG' is in the same directory as this script.")
+    st.info("Banner image not found. Skipping banner display.")
 
 # Initialize ground truth
 ground_truth = st.session_state.get('ground_truth', [])
@@ -92,19 +107,14 @@ if not ground_truth:
 def clean_text(text):
     if not isinstance(text, str):
         return ""
-    # Normalize whitespace
     text = re.sub(r'\s+', ' ', text)
-    # Remove non-ASCII characters
     text = re.sub(r'[^\x00-\x7F]+', '', text)
-    # Remove document artifacts (e.g., page numbers, headers, footers)
     text = re.sub(r'Page \d+ of \d+|CONFIDENTIAL|\[.*?\]|^\s*\d+\s*$', '', text, flags=re.IGNORECASE)
-    # Correct common OCR errors
     try:
         blob = TextBlob(text)
         text = str(blob.correct())
     except Exception as e:
         logging.warning(f"Spell checking failed: {e}")
-    # Normalize legal terms (e.g., non-compete variations)
     legal_terms = {
         'noncompete': 'non-compete',
         'non compete': 'non-compete',
@@ -119,10 +129,8 @@ def clean_text(text):
 def post_process_ocr(text):
     if not text:
         return ''
-    # Correct common OCR errors
     blob = TextBlob(text)
     corrected_text = str(blob.correct())
-    # Split merged words
     corrected_text = re.sub(r'(\w)([A-Z])', r'\1 \2', corrected_text)
     return clean_text(corrected_text)
 
@@ -478,14 +486,13 @@ def summarize_clause(clause_text, clause_type):
             )
             summary_text = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
         
-        # Entity preservation post-processing
         doc = nlp(clause_text)
         entities = []
         for ent in doc.ents:
             if ent.label_ in ['PERSON', 'ORG', 'DATE', 'GPE']:
                 entities.append(f"{ent.text} ({ent.label_})")
         if entities:
-            summary_text += " Key entities: " + ", ".join(set(entities))  # Use set to avoid duplicates
+            summary_text += " Key entities: " + ", ".join(set(entities))
         
         logging.debug(f"Generated summary for {clause_type} with {model_name}: {summary_text}")
         suggested_action = "Review clause for clarity and specificity."
@@ -740,10 +747,9 @@ def run_prediction(question_texts, context_text, model_path):
     do_lower_case = model_path == "alex-apostolo/legal-bert-base-cuad"
     null_score_diff_threshold = 0.0
 
-    # Preprocess context into clauses
     context_text = clean_text(context_text)
     clauses = segment_clauses(context_text)
-    context_text = ' '.join(clauses)  # Join for transformer input
+    context_text = ' '.join(clauses)
 
     logging.debug(f"Starting prediction with {len(question_texts)} questions and context length {len(context_text)} using model {model_path}")
 
@@ -878,18 +884,13 @@ def read_pdf(file):
     try:
         with pdfplumber.open(file) as pdfReader:
             for page in pdfReader.pages:
-                # Extract text with layout information
                 text = page.extract_text(layout=True)
                 if not text:
-                    # Fallback to PyMuPDF for scanned pages
                     doc = fitz.open(stream=file.read(), filetype="pdf")
                     page = doc[page._page_number - 1]
                     text = page.get_text("text")
                     if not text.strip():
-                        image = page.get_pixmap()
-                        text = pytesseract.image_to_string(Image.frombytes("RGB", [image.width, image.height], image.rgb))
-                        text = post_process_ocr(text)
-                # Filter out headers/footers based on position
+                        text = ""  # Skip OCR if Tesseract is unavailable
                 page_layout = page.extract_words()
                 text = ' '.join(word['text'] for word in page_layout if word['top'] > 50 and word['bottom'] < page.height - 50)
                 allpages += text + ' '
@@ -1091,7 +1092,7 @@ with tab3:
                         })
                     st.session_state.structured_results = structured_results
                     results_df = results_to_table(structured_results)
-                    results_df.to_csv(f'temp/results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv', index=False)
+                    results_df.to_csv(os.path.join(temp_dir, f'results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv'), index=False)
                     
                     if 'ground_truth' in st.session_state and st.session_state.ground_truth:
                         try:
@@ -1124,8 +1125,13 @@ with tab3:
                 logging.error(f"Error running complete analysis: {e}, Type: {type(e).__name__}, Line: {e.__traceback__.tb_lineno}")
 
     if st.session_state.structured_results:
-        with open(f'temp/results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv', 'rb') as f:
-            st.download_button(f'Download results as CSV ({st.session_state.classifier_type}, {st.session_state.extraction_model})', f, file_name=f'results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv', mime='text/csv')
+        with open(os.path.join(temp_dir, f'results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv'), 'rb') as f:
+            st.download_button(
+                f'Download results as CSV ({st.session_state.classifier_type}, {st.session_state.extraction_model})',
+                f,
+                file_name=f'results_{st.session_state.classifier_type}_{st.session_state.extraction_model.replace("/", "_")}.csv',
+                mime='text/csv'
+            )
         with st.expander("Show structured results"):
             st.dataframe(results_to_table(st.session_state.structured_results))
         
